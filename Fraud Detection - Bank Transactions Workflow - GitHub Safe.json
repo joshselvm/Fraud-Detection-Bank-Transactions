@@ -1,0 +1,547 @@
+{
+  "name": "Fraud Detection - Bank Transactions",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "3eef0527-97a1-4d94-97ec-1d009011b898",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1024,
+        -16
+      ],
+      "id": "155527b3-8bdd-4d96-8e05-9715aa4b5313",
+      "name": "Transaction Webhook",
+      "webhookId": "3eef0527-97a1-4d94-97ec-1d009011b898"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_SHEET_NAME",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -832,
+        -16
+      ],
+      "id": "debbae8b-dd0d-4ea1-9ce2-51ed41ea9e49",
+      "name": "Account History Lookup",
+      "credentials": {
+        "googleApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const accountNumber = $('Transaction Webhook').item.json.body.account_number;\nconst allRows = $input.all();\n\nconst matchedRow = allRows.find(row => row.json.account_number === accountNumber);\n\nif (!matchedRow) {\n  throw new Error(`Account ${accountNumber} not found in Account History`);\n}\n\nreturn [{\n  json: {\n    ...$('Transaction Webhook').item.json.body,\n    avg_transaction_amount: matchedRow.json.avg_transaction_amount,\n    known_locations: matchedRow.json.known_locations,\n    known_devices: matchedRow.json.known_devices,\n    account_age_days: matchedRow.json.account_age_days\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        -16
+      ],
+      "id": "991732a2-e683-4248-8f8d-8e40760d1af0",
+      "name": "Account Matcher"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\n\nlet score = 0;\nlet flags = [];\n\nconst amount = Number(data.amount);\nconst avgAmount = Number(data.avg_transaction_amount);\nconst accountAge = Number(data.account_age_days);\n\n// 1. Fixed rule: Large amount\nif (amount > 200000) { score += 30; flags.push('Large amount (>\u20b92,00,000)'); }\nelse if (amount > 50000) { score += 15; flags.push('Moderate-large amount (\u20b950k-2L)'); }\n\n// 2. Odd hour check\nconst hour = new Date(data.timestamp).getHours();\nif (hour >= 0 && hour < 5) { score += 20; flags.push('Transaction during odd hours (12AM-5AM)'); }\n\n// 3. New account check\nif (accountAge < 30) { score += 20; flags.push('New account (<30 days old)'); }\n\n// 4. Unknown location check\nconst knownLocations = (data.known_locations || '').split(',').map(l => l.trim());\nif (!knownLocations.includes(data.location)) {\n  score += 15;\n  flags.push(`Unknown location: ${data.location}`);\n}\n\n// 5. Unknown device check\nconst knownDevices = (data.known_devices || '').split(',').map(d => d.trim());\nif (!knownDevices.includes(data.device_id)) {\n  score += 15;\n  flags.push(`Unknown device: ${data.device_id}`);\n}\n\n// 6. Behavioral deviation - compare against account's own average\nlet deviationMultiple = 0;\nif (avgAmount > 0) {\n  deviationMultiple = amount / avgAmount;\n  if (deviationMultiple >= 10) { score += 25; flags.push(`Extreme deviation: ${deviationMultiple.toFixed(1)}x account's average`); }\n  else if (deviationMultiple >= 5) { score += 15; flags.push(`High deviation: ${deviationMultiple.toFixed(1)}x account's average`); }\n  else if (deviationMultiple >= 3) { score += 8; flags.push(`Moderate deviation: ${deviationMultiple.toFixed(1)}x account's average`); }\n}\n\n// Classification\nlet riskLevel = '';\nif (score >= 70) riskLevel = 'CRITICAL';\nelse if (score >= 50) riskLevel = 'HIGH';\nelse if (score >= 30) riskLevel = 'MEDIUM';\nelse riskLevel = 'LOW';\n\nreturn [{\n  json: {\n    ...data,\n    rule_score: score,\n    risk_level: riskLevel,\n    flags: flags.join('; '),\n    deviation_multiple: deviationMultiple.toFixed(1)\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -464,
+        -16
+      ],
+      "id": "e34c3c3b-ef2f-49fa-a81b-876b5098c381",
+      "name": "Rule Engine + Deviation Scorer"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GROQ_API_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"llama-3.1-8b-instant\", messages: [{ role: \"system\", content: \"You are a fraud analyst at a bank. Analyze flagged transactions and respond ONLY in JSON with keys: ai_score (1-100), ai_risk_level (LOW/MEDIUM/HIGH/CRITICAL), explanation (2 sentences max), recommendation (one clear action). No extra text.\" }, { role: \"user\", content: \"Analyze this flagged transaction:\\nAccount: \" + $json.account_number + \"\\nAmount: \u20b9\" + $json.amount + \"\\nAvg Transaction: \u20b9\" + $json.avg_transaction_amount + \"\\nDeviation: \" + $json.deviation_multiple + \"x\\nLocation: \" + $json.location + \"\\nKnown Locations: \" + $json.known_locations + \"\\nDevice: \" + $json.device_id + \"\\nKnown Devices: \" + $json.known_devices + \"\\nTime: \" + $json.timestamp + \"\\nRule Score: \" + $json.rule_score + \"/100\\nFlags: \" + $json.flags + \"\\nAccount Age: \" + $json.account_age_days + \" days\" }] }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        -272,
+        -16
+      ],
+      "id": "25f484bb-75a3-4906-ba56-0d540973737b",
+      "name": "Groq AI Fraud Analyzer"
+    },
+    {
+      "parameters": {
+        "jsCode": "const groqRaw = $input.first().json.choices[0].message.content;\nconst prev = $('Rule Engine + Deviation Scorer').item.json;\n\nlet aiResult;\ntry {\n  const cleaned = groqRaw.replace(/```json|```/g, '').trim();\n  aiResult = JSON.parse(cleaned);\n} catch(e) {\n  aiResult = {\n    ai_score: 0,\n    ai_risk_level: 'UNKNOWN',\n    explanation: groqRaw,\n    recommendation: 'Manual review required'\n  };\n}\n\nreturn [{\n  json: {\n    account_number: prev.account_number,\n    amount: prev.amount,\n    transaction_type: prev.transaction_type,\n    location: prev.location,\n    device_id: prev.device_id,\n    timestamp: prev.timestamp,\n    avg_transaction_amount: prev.avg_transaction_amount,\n    deviation_multiple: prev.deviation_multiple,\n    rule_score: prev.rule_score,\n    risk_level: prev.risk_level,\n    flags: prev.flags,\n    ai_score: aiResult.ai_score,\n    ai_risk_level: aiResult.ai_risk_level,\n    explanation: aiResult.explanation,\n    recommendation: aiResult.recommendation\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -96,
+        -16
+      ],
+      "id": "249cd0ac-0dbc-4cc1-865e-3073f43db64d",
+      "name": "Response Parser"
+    },
+    {
+      "parameters": {
+        "authentication": "serviceAccount",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "YOUR_SHEET_NAME",
+          "mode": "list",
+          "cachedResultName": "YOUR_SPREADSHEET",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_GOOGLE_SHEET_ID"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $json.timestamp }}",
+            "account_number": "={{ $json.account_number }}",
+            "amount": "={{ $json.amount }}",
+            "transaction_type": "={{ $json.transaction_type }}",
+            "location": "={{ $json.location }}",
+            "device_id": "={{ $json.device_id }}",
+            "deviation_multiple": "={{ $json.deviation_multiple }}",
+            "rule_score": "={{ $json.rule_score }}",
+            "risk_level": "={{ $json.risk_level }}",
+            "ai_score": "={{ $json.ai_score }}",
+            "ai_risk_level": "={{ $json.ai_risk_level }}",
+            "flags": "={{ $json.flags }}",
+            "explanation": "={{ $json.explanation }}",
+            "recommendation": "={{ $json.recommendation }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "account_number",
+              "displayName": "account_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "amount",
+              "displayName": "amount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "transaction_type",
+              "displayName": "transaction_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "location",
+              "displayName": "location",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "device_id",
+              "displayName": "device_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "deviation_multiple",
+              "displayName": "deviation_multiple",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "rule_score",
+              "displayName": "rule_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "risk_level",
+              "displayName": "risk_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ai_score",
+              "displayName": "ai_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ai_risk_level",
+              "displayName": "ai_risk_level",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "flags",
+              "displayName": "flags",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "explanation",
+              "displayName": "explanation",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "recommendation",
+              "displayName": "recommendation",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        64,
+        -16
+      ],
+      "id": "4404daa6-a047-4223-b999-a03d505007f6",
+      "name": "Transaction Log",
+      "credentials": {
+        "googleApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "962a7d41-8c88-4790-b619-f5288d7f73bd",
+              "leftValue": "={{ $json.risk_level }}",
+              "rightValue": "CRITICAL",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        208,
+        -16
+      ],
+      "id": "676b7926-2db0-4475-8f18-593480c41059",
+      "name": "Route CRITICAL"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "5c1d08f0-c4b7-46d7-9c02-13defe6c9e7e",
+              "leftValue": "={{ $json.risk_level }}",
+              "rightValue": "HIGH",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        256,
+        192
+      ],
+      "id": "5f5aad4e-0ca9-44d7-b221-747d3e44d23e",
+      "name": "Route HIGH"
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=\ud83d\udea8 FRAUD ALERT \u2014 {{ $json.risk_level }}\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n\ud83d\udc64 Account: {{ $json.account_number }}\n\ud83d\udcb0 Amount: \u20b9{{ $json.amount }}\n\ud83d\udd04 Type: {{ $json.transaction_type }}\n\ud83d\udccd Location: {{ $json.location }}\n\ud83d\udcf1 Device: {{ $json.device_id }}\n\ud83d\udd50 Time: {{ $json.timestamp }}\n\n\ud83d\udcca Rule Score: {{ $json.rule_score }}/100\n\ud83e\udd16 AI Score: {{ $json.ai_score }}/100\n\u26a0\ufe0f Risk Level: {{ $json.ai_risk_level }}\n\ud83d\udcc8 Deviation: {{ $json.deviation_multiple }}x average\n\n\ud83d\udea9 Flags:\n{{ $json.flags }}\n\n\ud83d\udca1 Explanation:\n{{ $json.explanation }}\n\n\u2705 Recommendation:\n{{ $json.recommendation }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        416,
+        -112
+      ],
+      "id": "61cbee24-4cd9-46aa-995a-e5f299d5c15f",
+      "name": "CRITICAL Alert \u2014 Telegram",
+      "webhookId": "c82ca2fd-345d-4450-bac0-b44da35d060e",
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=\u26a0\ufe0f FRAUD ALERT \u2014 HIGH RISK\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n\ud83d\udc64 Account: {{ $json.account_number }}\n\ud83d\udcb0 Amount: \u20b9{{ $json.amount }}\n\ud83d\udd04 Type: {{ $json.transaction_type }}\n\ud83d\udccd Location: {{ $json.location }}\n\ud83d\udcf1 Device: {{ $json.device_id }}\n\ud83d\udd50 Time: {{ $json.timestamp }}\n\n\ud83d\udcca Rule Score: {{ $json.rule_score }}/100\n\ud83e\udd16 AI Score: {{ $json.ai_score }}/100\n\ud83d\udcc8 Deviation: {{ $json.deviation_multiple }}x average\n\n\ud83d\udea9 Flags:\n{{ $json.flags }}\n\n\ud83d\udca1 Explanation:\n{{ $json.explanation }}\n\n\u2705 Recommendation:\n{{ $json.recommendation }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        464,
+        80
+      ],
+      "id": "56ff94ae-94a5-4c6b-9e33-d9475b5713b5",
+      "name": "HIGH Alert \u2014 Telegram",
+      "webhookId": "7dec18b4-785f-40ca-9c13-2c1c27bbbaaf",
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Transaction Webhook": {
+      "main": [
+        [
+          {
+            "node": "Account History Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Account History Lookup": {
+      "main": [
+        [
+          {
+            "node": "Account Matcher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Account Matcher": {
+      "main": [
+        [
+          {
+            "node": "Rule Engine + Deviation Scorer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rule Engine + Deviation Scorer": {
+      "main": [
+        [
+          {
+            "node": "Groq AI Fraud Analyzer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq AI Fraud Analyzer": {
+      "main": [
+        [
+          {
+            "node": "Response Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Response Parser": {
+      "main": [
+        [
+          {
+            "node": "Transaction Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transaction Log": {
+      "main": [
+        [
+          {
+            "node": "Route CRITICAL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route CRITICAL": {
+      "main": [
+        [
+          {
+            "node": "CRITICAL Alert \u2014 Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Route HIGH",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route HIGH": {
+      "main": [
+        [
+          {
+            "node": "HIGH Alert \u2014 Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false
+  },
+  "versionId": "d8734bef-b4f5-4e26-9bc6-f0b1fdd95e02",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "a371f6b5f86a32149fef48a8b4ee45e68fd58aec07e788e3a509e4c9c220f015"
+  },
+  "id": "WeUoJTdu9pILoYuw",
+  "tags": []
+}
